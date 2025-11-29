@@ -6,15 +6,36 @@ from pathlib import Path
 
 from .camera import Camera, find_available_camera
 from .detector import FaceDetector
-from .display import DisplayWindow, draw_faces, draw_fps, draw_face_count
+from .display import (
+    DisplayWindow, draw_faces, draw_fps, draw_face_count,
+    draw_central_face, draw_capture_mode_indicator, create_frame_with_sidebar,
+    draw_status_bar
+)
+from .face_capture import FaceCaptureSession, find_central_face
 
 
 def get_model_path() -> Path:
     """Get the default model path."""
-    # Look for model relative to this file's location
     src_dir = Path(__file__).parent.parent.parent
     model_path = src_dir / "models" / "det_10g.onnx"
     return model_path
+
+
+def get_name_from_user() -> str:
+    """Get a name from the user via console input.
+
+    Returns:
+        Name entered by user, or empty string if cancelled
+    """
+    print("\n" + "=" * 40)
+    print("Enter name for this person (or empty to cancel):")
+    try:
+        name = input("> ").strip()
+        # Sanitize name for filesystem
+        name = "".join(c for c in name if c.isalnum() or c in "._- ")
+        return name
+    except (EOFError, KeyboardInterrupt):
+        return ""
 
 
 def main():
@@ -101,11 +122,19 @@ def main():
         return 1
 
     # Initialize display
-    window = DisplayWindow("Face Detection - Press 'q' to quit")
+    window = DisplayWindow("Face Detection - Press 'q' to quit, 'c' for capture mode")
     window.create()
 
+    # Initialize capture session
+    capture_session = FaceCaptureSession()
+
     print("\nRunning face detection...")
-    print("Press 'q' to quit")
+    print("Controls:")
+    print("  q     - Quit")
+    print("  c     - Enter capture mode")
+    print("  SPACE - Capture face (in capture mode)")
+    print("  s     - Save captures (in capture mode)")
+    print("  ESC   - Exit capture mode / Quit")
     print("-" * 40)
 
     # FPS tracking
@@ -124,14 +153,44 @@ def main():
 
             # Detect faces
             faces = detector.detect(frame)
+            frame_h, frame_w = frame.shape[:2]
 
-            # Draw results
-            draw_faces(frame, faces, draw_landmarks=not args.no_landmarks)
-            draw_fps(frame, fps)
-            draw_face_count(frame, len(faces))
+            # Handle capture mode vs detection mode
+            if capture_session.is_capture_mode():
+                # Find central face
+                central_face = find_central_face(faces, frame_w, frame_h)
+
+                # Draw non-central faces normally
+                other_faces = [f for f in faces if f is not central_face]
+                draw_faces(frame, other_faces, draw_landmarks=not args.no_landmarks)
+
+                # Draw central face with highlight
+                if central_face:
+                    draw_central_face(frame, central_face, draw_landmarks=not args.no_landmarks)
+
+                # Draw capture mode indicator
+                draw_capture_mode_indicator(frame, capture_session.get_capture_count())
+
+                # Draw status bar
+                draw_status_bar(frame, "CAPTURE", "SPACE=capture  S=save  ESC=cancel")
+
+                # Create frame with sidebar showing captured thumbnails
+                thumbnails = [c.thumbnail for c in capture_session.captures]
+                display_frame = create_frame_with_sidebar(frame, thumbnails)
+
+            else:
+                # Normal detection mode
+                draw_faces(frame, faces, draw_landmarks=not args.no_landmarks)
+                draw_fps(frame, fps)
+                draw_face_count(frame, len(faces))
+
+                # Draw status bar
+                draw_status_bar(frame, "DETECTION", "C=capture mode  Q=quit")
+
+                display_frame = frame
 
             # Display
-            window.show(frame)
+            window.show(display_frame)
 
             # Update FPS
             frame_count += 1
@@ -139,15 +198,48 @@ def main():
                 elapsed = time.time() - start_time
                 fps = frame_count / elapsed
                 if frame_count >= 100:
-                    # Reset to avoid precision issues over long runs
                     frame_count = 0
                     start_time = time.time()
 
-            # Check for quit
+            # Handle key presses
             key = window.wait_key(1)
-            if key == ord('q') or key == 27:  # 'q' or ESC
+
+            if key == ord('q'):
                 print("\nQuitting...")
                 break
+
+            elif key == 27:  # ESC
+                if capture_session.is_capture_mode():
+                    print("\nExiting capture mode (discarding captures)")
+                    capture_session.exit_capture_mode(discard=True)
+                else:
+                    print("\nQuitting...")
+                    break
+
+            elif key == ord('c'):
+                if not capture_session.is_capture_mode():
+                    print("\nEntering capture mode")
+                    capture_session.enter_capture_mode()
+
+            elif key == ord(' '):  # SPACE
+                if capture_session.is_capture_mode():
+                    central_face = find_central_face(faces, frame_w, frame_h)
+                    if central_face:
+                        captured = capture_session.capture_face(frame, central_face)
+                        if captured:
+                            print(f"  Captured face #{capture_session.get_capture_count()}")
+                    else:
+                        print("  No face detected to capture")
+
+            elif key == ord('s'):
+                if capture_session.is_capture_mode() and capture_session.get_capture_count() > 0:
+                    name = get_name_from_user()
+                    if name:
+                        capture_session.save_captures(name)
+                        capture_session.exit_capture_mode(discard=False)
+                        print(f"Saved and exited capture mode")
+                    else:
+                        print("Save cancelled")
 
     except KeyboardInterrupt:
         print("\nInterrupted by user")
