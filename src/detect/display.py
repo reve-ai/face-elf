@@ -10,6 +10,8 @@ from .detector import Face
 # Colors (BGR format)
 BOX_COLOR = (0, 255, 0)  # Green
 CENTRAL_BOX_COLOR = (0, 255, 255)  # Yellow - for central face in capture mode
+RECOGNIZED_BOX_COLOR = (0, 255, 0)  # Green - for recognized faces
+UNKNOWN_BOX_COLOR = (0, 0, 255)  # Red - for unknown faces
 LANDMARK_COLOR = (0, 0, 255)  # Red
 TEXT_COLOR = (255, 255, 255)  # White
 TEXT_BG_COLOR = (0, 255, 0)  # Green
@@ -127,6 +129,76 @@ def draw_face_count(image: np.ndarray, count: int) -> np.ndarray:
     y = h - 20
     cv2.rectangle(image, (10, y - text_h - 5), (20 + text_w, y + baseline + 5), (0, 0, 0), -1)
     cv2.putText(image, label, (15, y), font, font_scale, (0, 255, 255), thickness)
+
+    return image
+
+
+def draw_recognized_face(
+    image: np.ndarray,
+    face: Face,
+    name: Optional[str],
+    similarity: float = 0.0,
+    draw_landmarks: bool = True
+) -> np.ndarray:
+    """Draw a face with recognition result.
+
+    Args:
+        image: BGR image to draw on
+        face: Detected face
+        name: Recognized name, or None if unknown
+        similarity: Similarity score (0-1)
+        draw_landmarks: Whether to draw facial landmarks
+
+    Returns:
+        Image with drawings
+    """
+    x1, y1, x2, y2 = face.bbox
+
+    if name:
+        # Recognized face - green box
+        box_color = RECOGNIZED_BOX_COLOR
+        label = f"{name} ({similarity:.0%})"
+        label_bg_color = RECOGNIZED_BOX_COLOR
+    else:
+        # Unknown face - red box
+        box_color = UNKNOWN_BOX_COLOR
+        label = "Unknown"
+        label_bg_color = UNKNOWN_BOX_COLOR
+
+    # Draw bounding box
+    cv2.rectangle(image, (x1, y1), (x2, y2), box_color, 2)
+
+    # Draw label
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.6
+    thickness = 2
+
+    (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+    # Draw background rectangle for text (above box)
+    cv2.rectangle(
+        image,
+        (x1, y1 - text_h - baseline - 8),
+        (x1 + text_w + 8, y1),
+        label_bg_color,
+        -1
+    )
+
+    # Draw text
+    cv2.putText(
+        image,
+        label,
+        (x1 + 4, y1 - baseline - 4),
+        font,
+        font_scale,
+        TEXT_COLOR,
+        thickness
+    )
+
+    # Draw landmarks
+    if draw_landmarks and face.landmarks is not None:
+        for lx, ly in face.landmarks:
+            cv2.circle(image, (int(lx), int(ly)), 2, box_color, -1)
 
     return image
 
