@@ -229,8 +229,12 @@ class ImguiApp:
         if action != glfw.PRESS:
             return
 
-        # Global shortcuts
-        if key == glfw.KEY_Q:
+        # Check if imgui wants keyboard input (e.g., text field is active)
+        io = imgui.get_io()
+        imgui_wants_keyboard = io.want_capture_keyboard
+
+        # Global shortcuts (always work)
+        if key == glfw.KEY_Q and not imgui_wants_keyboard:
             self.state.action_quit = True
         elif key == glfw.KEY_F11:
             self.state.action_toggle_fullscreen = True
@@ -239,6 +243,10 @@ class ImguiApp:
                 self.state.action_cancel_capture = True
             else:
                 self.state.action_quit = True
+
+        # Skip other shortcuts if imgui wants keyboard (typing in text field)
+        if imgui_wants_keyboard:
+            return
 
         # Mode-specific shortcuts
         if self.state.mode in ("detection", "recognition"):
@@ -334,7 +342,7 @@ class ImguiApp:
         self._render_video_panel(video_width, video_height, faces)
 
         imgui.set_next_window_position(video_width, menu_bar_height)
-        imgui.set_next_window_size(control_panel_width + sidebar_width, video_height)
+        imgui.set_next_window_size(control_panel_width, video_height)
         self._render_control_panel(control_panel_width, video_height)
 
         if self.state.mode == "capture":

@@ -337,12 +337,7 @@ def _handle_state_actions(
         app.clear_captures()
         state.action_capture_mode = False
 
-    # Capture face
-    if state.action_capture_face:
-        # This needs to be handled in main loop with access to frame and faces
-        # We'll set a flag and handle it there
-        state.action_capture_face = False
-        # The actual capture happens in the main loop
+    # Note: action_capture_face is handled in main loop where frame/faces are available
 
     # Save captures
     if state.action_save_captures:
