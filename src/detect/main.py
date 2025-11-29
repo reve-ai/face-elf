@@ -55,6 +55,11 @@ def main():
         action="store_true",
         help="Don't draw facial landmarks"
     )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU inference (disable TensorRT GPU)"
+    )
 
     args = parser.parse_args()
 
@@ -74,7 +79,8 @@ def main():
     # Initialize face detector
     detector = FaceDetector(
         model_path=str(model_path),
-        conf_threshold=args.conf_threshold
+        conf_threshold=args.conf_threshold,
+        use_gpu=not args.cpu
     )
     print("Model loaded successfully")
 

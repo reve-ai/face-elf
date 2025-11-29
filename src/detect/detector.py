@@ -1,10 +1,11 @@
 """Face detection module using SCRFD model."""
 
 import numpy as np
-import onnxruntime as ort
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 from pathlib import Path
+
+from .trt_backend import TensorRTBackend, is_tensorrt_available
 
 
 @dataclass
@@ -30,7 +31,7 @@ class Face:
 
 
 class FaceDetector:
-    """SCRFD-based face detector using ONNX Runtime."""
+    """SCRFD-based face detector using TensorRT (GPU) or ONNX Runtime (CPU)."""
 
     def __init__(
         self,
@@ -38,6 +39,7 @@ class FaceDetector:
         input_size: Tuple[int, int] = (640, 640),
         conf_threshold: float = 0.5,
         nms_threshold: float = 0.4,
+        use_gpu: bool = True,
     ):
         """Initialize face detector.
 
@@ -46,18 +48,36 @@ class FaceDetector:
             input_size: Model input size (width, height)
             conf_threshold: Confidence threshold for detections
             nms_threshold: NMS IoU threshold
+            use_gpu: Use TensorRT GPU acceleration if available
         """
         self.input_size = input_size
         self.conf_threshold = conf_threshold
         self.nms_threshold = nms_threshold
+        self.model_path = model_path
 
         # Feature map strides for SCRFD
         self.strides = [8, 16, 32]
 
-        # Load ONNX model
-        providers = ['CPUExecutionProvider']
-        self.session = ort.InferenceSession(model_path, providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
+        # Try to use TensorRT for GPU acceleration
+        self.use_tensorrt = False
+        self.trt_backend = None
+        self.session = None
+
+        if use_gpu and is_tensorrt_available():
+            try:
+                self.trt_backend = TensorRTBackend(model_path, input_size)
+                self.use_tensorrt = True
+                print("Using TensorRT GPU acceleration")
+            except Exception as e:
+                print(f"TensorRT initialization failed: {e}")
+                print("Falling back to CPU inference")
+
+        if not self.use_tensorrt:
+            import onnxruntime as ort
+            providers = ['CPUExecutionProvider']
+            self.session = ort.InferenceSession(model_path, providers=providers)
+            self.input_name = self.session.get_inputs()[0].name
+            print("Using ONNX Runtime CPU inference")
 
         # Generate anchors for each stride
         self._generate_anchors()
@@ -284,7 +304,10 @@ class FaceDetector:
         blob, scale, pad = self._preprocess(image)
 
         # Run inference
-        outputs = self.session.run(None, {self.input_name: blob})
+        if self.use_tensorrt:
+            outputs = self.trt_backend.infer(blob)
+        else:
+            outputs = self.session.run(None, {self.input_name: blob})
 
         # Decode outputs
         faces = self._decode_outputs(outputs, scale, pad)
