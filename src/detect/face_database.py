@@ -148,7 +148,7 @@ class UnknownFaceTracker:
     def __init__(
         self,
         output_dir: str = "new-faces",
-        min_save_interval: float = 1.0,
+        min_save_interval: float = 3.0,
     ):
         """Initialize unknown face tracker.
 

@@ -21,10 +21,29 @@ class BrowsePersonInfo:
 
 
 @dataclass
+class UnknownDayInfo:
+    """Info about a day's unknown faces."""
+    day_label: str  # e.g., "2024-01-15"
+    folder_path: str
+    image_count: int
+    thumbnail: Optional[np.ndarray] = None
+    texture_id: Optional[int] = None
+
+
+@dataclass
+class UnknownFaceInfo:
+    """Info about a single unknown face image."""
+    path: str
+    day_label: str
+    texture_id: Optional[int] = None
+    selected: bool = False
+
+
+@dataclass
 class AppState:
     """Application state shared across UI components."""
     # Mode
-    mode: str = "recognition"  # "detection", "recognition", "capture", "browse"
+    mode: str = "recognition"  # "detection", "recognition", "capture", "browse", "unknown_browse"
 
     # Detection settings
     conf_threshold: float = 0.5
@@ -39,11 +58,18 @@ class AppState:
     capture_name: str = ""
     capture_thumbnails: List[np.ndarray] = field(default_factory=list)
 
-    # Browse mode
+    # Browse mode (known faces)
     browse_people: List[BrowsePersonInfo] = field(default_factory=list)
     browse_selected_person: Optional[str] = None
     browse_person_images: List[Tuple[str, Optional[int]]] = field(default_factory=list)  # (path, texture_id)
     browse_delete_confirmed: Optional[str] = None  # path to delete after confirmation
+
+    # Unknown faces browse mode
+    unknown_days: List["UnknownDayInfo"] = field(default_factory=list)
+    unknown_faces: List["UnknownFaceInfo"] = field(default_factory=list)
+    unknown_selected_day: Optional[str] = None  # selected day folder path
+    unknown_move_target: str = ""  # target person name for moving
+    unknown_new_person_name: str = ""  # new person name input
 
     # Actions (set by UI, cleared by main loop)
     action_quit: bool = False
@@ -55,6 +81,8 @@ class AppState:
     action_toggle_fullscreen: bool = False
     action_browse_mode: bool = False
     action_exit_browse: bool = False
+    action_unknown_browse_mode: bool = False
+    action_exit_unknown_browse: bool = False
 
 
 class TextureManager:
@@ -283,6 +311,8 @@ class ImguiApp:
                 self.state.action_cancel_capture = True
             elif self.state.mode == "browse":
                 self.state.action_exit_browse = True
+            elif self.state.mode == "unknown_browse":
+                self.state.action_exit_unknown_browse = True
             else:
                 self.state.action_quit = True
 
@@ -298,6 +328,8 @@ class ImguiApp:
                 self.state.action_reload_db = True
             elif key == glfw.KEY_B:
                 self.state.action_browse_mode = True
+            elif key == glfw.KEY_U:
+                self.state.action_unknown_browse_mode = True
 
         elif self.state.mode == "capture":
             if key == glfw.KEY_SPACE:
@@ -466,13 +498,186 @@ class ImguiApp:
         self.state.browse_person_images.clear()
         self.state.browse_delete_confirmed = None
 
+    def load_unknown_faces_data(self, unknown_faces_dir: str = "new-faces"):
+        """Load unknown faces data - grouped by day."""
+        from pathlib import Path
+
+        self.clear_unknown_faces_data()
+        unknown_dir = Path(unknown_faces_dir)
+
+        if not unknown_dir.exists():
+            return
+
+        # Each subdirectory is a timestamp (YYYY-MM-DD-HH-MM)
+        for day_dir in sorted(unknown_dir.iterdir(), reverse=True):
+            if not day_dir.is_dir():
+                continue
+
+            folder_name = day_dir.name
+            # Extract date part (YYYY-MM-DD)
+            day_label = folder_name[:10] if len(folder_name) >= 10 else folder_name
+
+            images = list(day_dir.glob("*.jpg")) + list(day_dir.glob("*.png"))
+            image_count = len(images)
+
+            if image_count == 0:
+                continue
+
+            # Load first image as thumbnail
+            thumbnail = cv2.imread(str(images[0]))
+            if thumbnail is None:
+                continue
+
+            # Resize thumbnail to square
+            h, w = thumbnail.shape[:2]
+            size = min(h, w)
+            y_off = (h - size) // 2
+            x_off = (w - size) // 2
+            thumbnail = thumbnail[y_off:y_off+size, x_off:x_off+size]
+            thumbnail = cv2.resize(thumbnail, (128, 128))
+
+            # Create texture
+            texture_id = self.texture_manager.create_browse_texture(thumbnail)
+
+            day_info = UnknownDayInfo(
+                day_label=day_label,
+                folder_path=str(day_dir),
+                image_count=image_count,
+                thumbnail=thumbnail,
+                texture_id=texture_id
+            )
+            self.state.unknown_days.append(day_info)
+
+    def load_unknown_day_images(self, folder_path: str):
+        """Load all unknown face images from a specific day folder."""
+        from pathlib import Path
+
+        # Clear previous images but keep day list
+        self.state.unknown_faces.clear()
+        self.state.unknown_selected_day = folder_path
+
+        day_dir = Path(folder_path)
+        if not day_dir.exists():
+            return
+
+        day_label = day_dir.name[:10] if len(day_dir.name) >= 10 else day_dir.name
+        images = sorted(list(day_dir.glob("*.jpg")) + list(day_dir.glob("*.png")))
+
+        for img_path in images:
+            img = cv2.imread(str(img_path))
+            if img is None:
+                continue
+
+            # Resize for display
+            h, w = img.shape[:2]
+            size = min(h, w)
+            y_off = (h - size) // 2
+            x_off = (w - size) // 2
+            img = img[y_off:y_off+size, x_off:x_off+size]
+            img = cv2.resize(img, (128, 128))
+
+            texture_id = self.texture_manager.create_browse_texture(img)
+            face_info = UnknownFaceInfo(
+                path=str(img_path),
+                day_label=day_label,
+                texture_id=texture_id,
+                selected=False
+            )
+            self.state.unknown_faces.append(face_info)
+
+    def move_selected_unknown_to_person(self, person_name: str, known_faces_dir: str = "known-faces"):
+        """Move selected unknown faces to a known person's directory."""
+        from pathlib import Path
+        import shutil
+
+        if not person_name.strip():
+            return 0
+
+        # Sanitize name
+        person_name = "".join(c for c in person_name.strip() if c.isalnum() or c in "._- ")
+        person_dir = Path(known_faces_dir) / person_name
+        person_dir.mkdir(parents=True, exist_ok=True)
+
+        # Find next available index
+        existing = list(person_dir.glob("*.jpg")) + list(person_dir.glob("*.png"))
+        next_idx = len(existing) + 1
+
+        moved_count = 0
+        for face in self.state.unknown_faces:
+            if face.selected:
+                src_path = Path(face.path)
+                if src_path.exists():
+                    # Determine extension
+                    ext = src_path.suffix
+                    dst_path = person_dir / f"{next_idx:03d}{ext}"
+                    shutil.move(str(src_path), str(dst_path))
+                    next_idx += 1
+                    moved_count += 1
+                    print(f"Moved {src_path.name} to {dst_path}")
+
+        return moved_count
+
+    def delete_unknown_face(self, face_path: str):
+        """Delete a single unknown face image."""
+        from pathlib import Path
+        import os
+
+        path = Path(face_path)
+        if path.exists():
+            os.remove(path)
+            print(f"Deleted: {face_path}")
+            return True
+        return False
+
+    def delete_unknown_day(self, folder_path: str):
+        """Delete all images in an unknown faces day folder."""
+        from pathlib import Path
+        import shutil
+
+        path = Path(folder_path)
+        if path.exists() and path.is_dir():
+            shutil.rmtree(path)
+            print(f"Deleted folder: {folder_path}")
+            return True
+        return False
+
+    def delete_all_unknown_faces(self, unknown_faces_dir: str = "new-faces"):
+        """Delete all unknown faces."""
+        from pathlib import Path
+        import shutil
+
+        unknown_dir = Path(unknown_faces_dir)
+        if unknown_dir.exists():
+            for item in unknown_dir.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item)
+            print(f"Deleted all unknown faces from {unknown_faces_dir}")
+            return True
+        return False
+
+    def clear_unknown_faces_data(self):
+        """Clear unknown faces browse mode state."""
+        self.texture_manager.clear_browse_textures()
+        self.state.unknown_days.clear()
+        self.state.unknown_faces.clear()
+        self.state.unknown_selected_day = None
+        self.state.unknown_move_target = ""
+        self.state.unknown_new_person_name = ""
+
+    def get_selected_unknown_count(self) -> int:
+        """Get count of selected unknown faces."""
+        return sum(1 for f in self.state.unknown_faces if f.selected)
+
     def render_ui(self, faces: list = None):
         """Render the complete UI."""
         window_w, window_h = glfw.get_window_size(self.window)
 
-        # Browse mode has its own full-screen layout
+        # Browse modes have their own full-screen layout
         if self.state.mode == "browse":
             self._render_browse_mode(window_w, window_h)
+            return
+        elif self.state.mode == "unknown_browse":
+            self._render_unknown_browse_mode(window_w, window_h)
             return
 
         # Main menu bar height
@@ -656,6 +861,10 @@ class ImguiApp:
             if imgui.button("Browse Faces (B)", width=button_width):
                 self.state.action_browse_mode = True
 
+            imgui.spacing()
+            if imgui.button("Unknown Faces (U)", width=button_width):
+                self.state.action_unknown_browse_mode = True
+
         elif self.state.mode == "capture":
             imgui.text(f"Captured: {self.state.capture_count}")
             imgui.spacing()
@@ -735,11 +944,13 @@ class ImguiApp:
         if self.state.mode == "capture":
             help_text = "SPACE=capture  S=save  ESC=cancel"
         elif self.state.mode == "recognition":
-            help_text = "C=capture  R=reload  B=browse  Q=quit  F11=fullscreen"
+            help_text = "C=capture  R=reload  B=browse  U=unknown  Q=quit  F11=fullscreen"
         elif self.state.mode == "browse":
             help_text = "ESC=back/close"
+        elif self.state.mode == "unknown_browse":
+            help_text = "Click to select  ESC=back/close"
         else:
-            help_text = "C=capture  B=browse  Q=quit  F11=fullscreen"
+            help_text = "C=capture  B=browse  U=unknown  Q=quit  F11=fullscreen"
 
         imgui.text_colored(help_text, 0.7, 0.7, 0.7)
 
@@ -882,6 +1093,312 @@ class ImguiApp:
                 self.load_person_images(person_name)
 
         imgui.end()
+
+    def _render_unknown_browse_mode(self, window_w: float, window_h: float):
+        """Render the unknown faces browse mode."""
+        # If a day is selected, show its images
+        if self.state.unknown_selected_day:
+            self._render_unknown_day_detail(window_w, window_h)
+            return
+
+        # Otherwise show the day grid
+        flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE |
+                imgui.WINDOW_NO_MOVE)
+
+        imgui.set_next_window_position(0, 0)
+        imgui.set_next_window_size(window_w, window_h)
+        imgui.begin("Unknown Faces", flags=flags)
+
+        # Header
+        imgui.text_colored("BROWSE UNKNOWN FACES", 1.0, 0.6, 0.2)
+        imgui.same_line(spacing=40)
+        if imgui.button("Close (ESC)"):
+            self.state.action_exit_unknown_browse = True
+        imgui.same_line(spacing=20)
+
+        # Delete all button
+        imgui.push_style_color(imgui.COLOR_BUTTON, 0.6, 0.1, 0.1, 1.0)
+        imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.8, 0.2, 0.2, 1.0)
+        if imgui.button("Delete ALL Unknown Faces"):
+            imgui.open_popup("confirm_delete_all")
+        imgui.pop_style_color(2)
+
+        # Confirmation popup for delete all
+        if imgui.begin_popup_modal("confirm_delete_all", flags=imgui.WINDOW_ALWAYS_AUTO_RESIZE)[0]:
+            imgui.text("Are you sure you want to delete ALL unknown faces?")
+            imgui.text("This cannot be undone!")
+            imgui.spacing()
+            if imgui.button("Yes, Delete All", width=150):
+                self.delete_all_unknown_faces()
+                self.texture_manager.clear_browse_textures()
+                self.load_unknown_faces_data()
+                imgui.close_current_popup()
+            imgui.same_line()
+            if imgui.button("Cancel", width=150):
+                imgui.close_current_popup()
+            imgui.end_popup()
+
+        imgui.separator()
+        imgui.spacing()
+
+        if not self.state.unknown_days:
+            imgui.text("No unknown faces found.")
+            imgui.end()
+            return
+
+        # Calculate grid layout
+        tile_size = int(180 * self.dpi_scale)
+        padding = int(10 * self.dpi_scale)
+        thumb_size = int(128 * self.dpi_scale)
+
+        available_width = window_w - int(40 * self.dpi_scale)
+        cols = max(1, int(available_width // (tile_size + padding)))
+
+        # Begin scrollable region
+        imgui.begin_child("DayGrid", 0, 0, border=False)
+
+        delete_folder = None
+
+        for i, day in enumerate(self.state.unknown_days):
+            col = i % cols
+
+            if col > 0:
+                imgui.same_line(spacing=padding)
+
+            # Day tile
+            imgui.begin_group()
+
+            # Thumbnail (clickable)
+            if day.texture_id:
+                clicked = imgui.image_button(
+                    day.texture_id, thumb_size, thumb_size,
+                    frame_padding=2
+                )
+                if clicked:
+                    self.load_unknown_day_images(day.folder_path)
+
+            # Day label and count below
+            imgui.text(day.day_label)
+            imgui.text_colored(f"{day.image_count} images", 0.6, 0.6, 0.6)
+
+            # Delete day button
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.6, 0.1, 0.1, 1.0)
+            imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.8, 0.2, 0.2, 1.0)
+            if imgui.button(f"Delete Day##{i}", width=thumb_size):
+                delete_folder = day.folder_path
+            imgui.pop_style_color(2)
+
+            imgui.end_group()
+
+            # Add spacing after each row
+            if col == cols - 1:
+                imgui.spacing()
+
+        imgui.end_child()
+
+        # Handle day deletion
+        if delete_folder:
+            self.delete_unknown_day(delete_folder)
+            self.texture_manager.clear_browse_textures()
+            self.load_unknown_faces_data()
+
+        imgui.end()
+
+    def _render_unknown_day_detail(self, window_w: float, window_h: float):
+        """Render detail view for a selected day's unknown faces."""
+        from pathlib import Path
+
+        flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE |
+                imgui.WINDOW_NO_MOVE)
+
+        imgui.set_next_window_position(0, 0)
+        imgui.set_next_window_size(window_w, window_h)
+        imgui.begin("Unknown Day Detail", flags=flags)
+
+        # Extract day label from path
+        day_path = Path(self.state.unknown_selected_day)
+        day_label = day_path.name
+
+        # Header
+        imgui.text_colored(f"UNKNOWN FACES: {day_label}", 1.0, 0.6, 0.2)
+        imgui.same_line(spacing=40)
+        if imgui.button("Back (ESC)"):
+            self.state.unknown_selected_day = None
+            self.state.unknown_faces.clear()
+            # Clear selection state
+            for face in self.state.unknown_faces:
+                face.selected = False
+
+        imgui.separator()
+
+        # Selection info and actions bar
+        selected_count = self.get_selected_unknown_count()
+        imgui.text(f"Selected: {selected_count} / {len(self.state.unknown_faces)}")
+        imgui.same_line(spacing=20)
+
+        # Select All / Deselect All
+        if imgui.button("Select All"):
+            for face in self.state.unknown_faces:
+                face.selected = True
+        imgui.same_line()
+        if imgui.button("Deselect All"):
+            for face in self.state.unknown_faces:
+                face.selected = False
+
+        imgui.same_line(spacing=40)
+
+        # Delete selected button
+        if selected_count > 0:
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.6, 0.1, 0.1, 1.0)
+            imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.8, 0.2, 0.2, 1.0)
+            if imgui.button(f"Delete Selected ({selected_count})"):
+                self._delete_selected_unknown_faces()
+            imgui.pop_style_color(2)
+
+        imgui.separator()
+
+        # Move to person section
+        if selected_count > 0:
+            imgui.text("Move selected to:")
+            imgui.same_line()
+
+            # Existing person dropdown
+            existing_people = self._get_existing_people()
+            if existing_people:
+                imgui.set_next_item_width(150 * self.dpi_scale)
+                preview = self.state.unknown_move_target or "Select person..."
+                if imgui.begin_combo("##existing", preview):
+                    for person in existing_people:
+                        is_selected = (person == self.state.unknown_move_target)
+                        if imgui.selectable(person, is_selected)[0]:
+                            self.state.unknown_move_target = person
+                    imgui.end_combo()
+
+                imgui.same_line()
+                if self.state.unknown_move_target and imgui.button("Move to Existing"):
+                    self._move_and_refresh(self.state.unknown_move_target)
+
+            imgui.same_line(spacing=30)
+            imgui.text("Or new person:")
+            imgui.same_line()
+            imgui.set_next_item_width(150 * self.dpi_scale)
+            changed, self.state.unknown_new_person_name = imgui.input_text(
+                "##newperson", self.state.unknown_new_person_name, 64
+            )
+            imgui.same_line()
+            if self.state.unknown_new_person_name.strip() and imgui.button("Move to New"):
+                self._move_and_refresh(self.state.unknown_new_person_name.strip())
+                self.state.unknown_new_person_name = ""
+
+            imgui.separator()
+
+        imgui.spacing()
+
+        # Calculate grid layout
+        tile_size = int(160 * self.dpi_scale)
+        padding = int(10 * self.dpi_scale)
+        thumb_size = int(128 * self.dpi_scale)
+
+        available_width = window_w - int(40 * self.dpi_scale)
+        cols = max(1, int(available_width // (tile_size + padding)))
+
+        # Begin scrollable region
+        imgui.begin_child("UnknownImageGrid", 0, 0, border=False)
+
+        delete_path = None
+
+        for i, face in enumerate(self.state.unknown_faces):
+            col = i % cols
+
+            if col > 0:
+                imgui.same_line(spacing=padding)
+
+            # Image tile
+            imgui.begin_group()
+
+            # Selection indicator and thumbnail
+            if face.selected:
+                # Draw selection highlight
+                imgui.push_style_color(imgui.COLOR_BUTTON, 0.2, 0.6, 0.2, 1.0)
+                imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.3, 0.7, 0.3, 1.0)
+
+            if face.texture_id:
+                clicked = imgui.image_button(
+                    face.texture_id, thumb_size, thumb_size,
+                    frame_padding=4 if face.selected else 2
+                )
+                if clicked:
+                    face.selected = not face.selected
+
+            if face.selected:
+                imgui.pop_style_color(2)
+
+            # Checkbox for selection
+            changed, face.selected = imgui.checkbox(f"##sel{i}", face.selected)
+
+            imgui.same_line()
+
+            # Delete button
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.6, 0.1, 0.1, 1.0)
+            imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.8, 0.2, 0.2, 1.0)
+            if imgui.button(f"Del##{i}"):
+                delete_path = face.path
+            imgui.pop_style_color(2)
+
+            imgui.end_group()
+
+            # Add spacing after each row
+            if col == cols - 1:
+                imgui.spacing()
+
+        imgui.end_child()
+
+        # Handle single deletion
+        if delete_path:
+            self.delete_unknown_face(delete_path)
+            self._refresh_unknown_day_view()
+
+        imgui.end()
+
+    def _get_existing_people(self, known_faces_dir: str = "known-faces") -> List[str]:
+        """Get list of existing known people."""
+        from pathlib import Path
+        known_dir = Path(known_faces_dir)
+        if not known_dir.exists():
+            return []
+        return sorted([d.name for d in known_dir.iterdir() if d.is_dir()])
+
+    def _delete_selected_unknown_faces(self):
+        """Delete all selected unknown faces."""
+        for face in self.state.unknown_faces:
+            if face.selected:
+                self.delete_unknown_face(face.path)
+        self._refresh_unknown_day_view()
+
+    def _move_and_refresh(self, person_name: str):
+        """Move selected faces to person and refresh view."""
+        moved = self.move_selected_unknown_to_person(person_name)
+        if moved > 0:
+            print(f"Moved {moved} faces to {person_name}")
+            self._refresh_unknown_day_view()
+            self.state.unknown_move_target = ""
+
+    def _refresh_unknown_day_view(self):
+        """Refresh the current unknown day view."""
+        folder_path = self.state.unknown_selected_day
+        self.texture_manager.clear_browse_textures()
+        self.load_unknown_faces_data()
+        # Check if folder still exists and has images
+        from pathlib import Path
+        if folder_path and Path(folder_path).exists():
+            images = list(Path(folder_path).glob("*.jpg")) + list(Path(folder_path).glob("*.png"))
+            if images:
+                self.load_unknown_day_images(folder_path)
+            else:
+                # Folder is empty, go back to day list
+                self.state.unknown_selected_day = None
+        else:
+            self.state.unknown_selected_day = None
 
     def shutdown(self):
         """Clean up resources."""

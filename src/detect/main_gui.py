@@ -153,7 +153,7 @@ def main():
 
         unknown_tracker = UnknownFaceTracker(
             output_dir="new-faces",
-            min_save_interval=1.0
+            min_save_interval=3.0
         )
 
     # Find camera
@@ -205,8 +205,8 @@ def main():
                 app, capture_session, face_db, recognition_enabled
             )
 
-            # Browse mode - skip camera and detection
-            if app.state.mode == "browse":
+            # Browse modes - skip camera and detection
+            if app.state.mode in ("browse", "unknown_browse"):
                 app.begin_frame()
                 app.render_ui()
                 app.end_frame()
@@ -408,6 +408,31 @@ def _handle_state_actions(
                 face_db.load_known_faces()
                 app.state.known_faces_count = face_db.get_person_count()
         state.action_exit_browse = False
+
+    # Enter unknown faces browse mode
+    if state.action_unknown_browse_mode:
+        print("Entering unknown faces browse mode")
+        app.load_unknown_faces_data()
+        state.mode = "unknown_browse"
+        state.action_unknown_browse_mode = False
+
+    # Exit unknown faces browse mode
+    if state.action_exit_unknown_browse:
+        if state.unknown_selected_day:
+            # Go back to day list first
+            state.unknown_selected_day = None
+            state.unknown_faces.clear()
+        else:
+            # Exit unknown browse mode entirely
+            print("Exiting unknown faces browse mode")
+            app.clear_unknown_faces_data()
+            state.mode = "recognition" if recognition_enabled else "detection"
+            # Reload database in case faces were moved to known
+            if recognition_enabled and face_db:
+                print("Reloading known faces database...")
+                face_db.load_known_faces()
+                app.state.known_faces_count = face_db.get_person_count()
+        state.action_exit_unknown_browse = False
 
 
 # Handle capture face action in main loop

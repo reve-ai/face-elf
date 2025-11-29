@@ -161,7 +161,7 @@ def main():
 
         unknown_tracker = UnknownFaceTracker(
             output_dir="new-faces",
-            min_save_interval=1.0
+            min_save_interval=3.0
         )
 
     # Find camera
