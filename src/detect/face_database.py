@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import time
 
 from .embedder import FaceEmbedder
+from .face_capture import normalize_lighting
 
 
 @dataclass
@@ -73,6 +74,9 @@ class FaceDatabase:
                 if image is None:
                     continue
 
+                # Normalize lighting before computing embedding
+                image = normalize_lighting(image)
+
                 # Compute embedding
                 embedding = self.embedder.get_embedding(image)
                 person.embeddings.append(embedding)
@@ -83,6 +87,9 @@ class FaceDatabase:
                 image = cv2.imread(str(image_path))
                 if image is None:
                     continue
+
+                # Normalize lighting before computing embedding
+                image = normalize_lighting(image)
 
                 embedding = self.embedder.get_embedding(image)
                 person.embeddings.append(embedding)
