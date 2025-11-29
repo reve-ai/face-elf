@@ -1,5 +1,5 @@
 """GUI module for face detection and recognition."""
 
-from .app import ImguiApp, AppState, TextureManager
+from .app import ImguiApp, AppState, TextureManager, BrowsePersonInfo
 
-__all__ = ['ImguiApp', 'AppState', 'TextureManager']
+__all__ = ['ImguiApp', 'AppState', 'TextureManager', 'BrowsePersonInfo']

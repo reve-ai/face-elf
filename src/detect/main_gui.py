@@ -205,6 +205,13 @@ def main():
                 app, capture_session, face_db, recognition_enabled
             )
 
+            # Browse mode - skip camera and detection
+            if app.state.mode == "browse":
+                app.begin_frame()
+                app.render_ui()
+                app.end_frame()
+                continue
+
             # Update detector threshold if changed
             detector.conf_threshold = app.state.conf_threshold
             if face_db:
@@ -376,6 +383,31 @@ def _handle_state_actions(
             face_db.load_known_faces()
             app.state.known_faces_count = face_db.get_person_count()
         state.action_reload_db = False
+
+    # Enter browse mode
+    if state.action_browse_mode:
+        print("Entering browse mode")
+        app.load_browse_data()
+        state.mode = "browse"
+        state.action_browse_mode = False
+
+    # Exit browse mode
+    if state.action_exit_browse:
+        if state.browse_selected_person:
+            # Go back to person list first
+            state.browse_selected_person = None
+            state.browse_person_images.clear()
+        else:
+            # Exit browse mode entirely
+            print("Exiting browse mode")
+            app.clear_browse_data()
+            state.mode = "recognition" if recognition_enabled else "detection"
+            # Reload database in case images were deleted
+            if recognition_enabled and face_db:
+                print("Reloading known faces database...")
+                face_db.load_known_faces()
+                app.state.known_faces_count = face_db.get_person_count()
+        state.action_exit_browse = False
 
 
 # Handle capture face action in main loop

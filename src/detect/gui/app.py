@@ -12,10 +12,19 @@ import time
 
 
 @dataclass
+class BrowsePersonInfo:
+    """Info about a person in browse mode."""
+    name: str
+    image_count: int
+    thumbnail: Optional[np.ndarray] = None
+    texture_id: Optional[int] = None
+
+
+@dataclass
 class AppState:
     """Application state shared across UI components."""
     # Mode
-    mode: str = "recognition"  # "detection", "recognition", "capture"
+    mode: str = "recognition"  # "detection", "recognition", "capture", "browse"
 
     # Detection settings
     conf_threshold: float = 0.5
@@ -30,6 +39,12 @@ class AppState:
     capture_name: str = ""
     capture_thumbnails: List[np.ndarray] = field(default_factory=list)
 
+    # Browse mode
+    browse_people: List[BrowsePersonInfo] = field(default_factory=list)
+    browse_selected_person: Optional[str] = None
+    browse_person_images: List[Tuple[str, Optional[int]]] = field(default_factory=list)  # (path, texture_id)
+    browse_delete_confirmed: Optional[str] = None  # path to delete after confirmation
+
     # Actions (set by UI, cleared by main loop)
     action_quit: bool = False
     action_capture_mode: bool = False
@@ -38,6 +53,8 @@ class AppState:
     action_cancel_capture: bool = False
     action_reload_db: bool = False
     action_toggle_fullscreen: bool = False
+    action_browse_mode: bool = False
+    action_exit_browse: bool = False
 
 
 class TextureManager:
@@ -47,6 +64,7 @@ class TextureManager:
         self.video_texture: Optional[int] = None
         self.video_size: Tuple[int, int] = (0, 0)
         self.thumbnail_textures: List[int] = []
+        self.browse_textures: List[int] = []  # For browse mode
 
     def update_video_texture(self, frame: np.ndarray) -> int:
         """Update or create video texture from BGR frame."""
@@ -94,11 +112,33 @@ class TextureManager:
             gl.glDeleteTextures(len(self.thumbnail_textures), self.thumbnail_textures)
             self.thumbnail_textures.clear()
 
+    def create_browse_texture(self, image: np.ndarray) -> int:
+        """Create a texture for browse mode."""
+        h, w = image.shape[:2]
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        texture_id = gl.glGenTextures(1)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, texture_id)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB, w, h, 0,
+                       gl.GL_RGB, gl.GL_UNSIGNED_BYTE, rgb)
+
+        self.browse_textures.append(texture_id)
+        return texture_id
+
+    def clear_browse_textures(self):
+        """Delete all browse mode textures."""
+        if self.browse_textures:
+            gl.glDeleteTextures(len(self.browse_textures), self.browse_textures)
+            self.browse_textures.clear()
+
     def cleanup(self):
         """Clean up all textures."""
         if self.video_texture is not None:
             gl.glDeleteTextures(1, [self.video_texture])
         self.clear_thumbnails()
+        self.clear_browse_textures()
 
 
 class ImguiApp:
@@ -241,6 +281,8 @@ class ImguiApp:
         elif key == glfw.KEY_ESCAPE:
             if self.state.mode == "capture":
                 self.state.action_cancel_capture = True
+            elif self.state.mode == "browse":
+                self.state.action_exit_browse = True
             else:
                 self.state.action_quit = True
 
@@ -254,12 +296,18 @@ class ImguiApp:
                 self.state.action_capture_mode = True
             elif key == glfw.KEY_R and self.state.mode == "recognition":
                 self.state.action_reload_db = True
+            elif key == glfw.KEY_B:
+                self.state.action_browse_mode = True
 
         elif self.state.mode == "capture":
             if key == glfw.KEY_SPACE:
                 self.state.action_capture_face = True
             elif key == glfw.KEY_S:
                 self.state.action_save_captures = True
+
+        elif self.state.mode == "browse":
+            # ESC is handled above (action_exit_browse or action_quit)
+            pass
 
     def toggle_fullscreen(self):
         """Toggle between fullscreen and windowed mode."""
@@ -321,9 +369,111 @@ class ImguiApp:
         self.state.capture_count = 0
         self.state.capture_name = ""
 
+    def load_browse_data(self, known_faces_dir: str = "known-faces"):
+        """Load browse mode data - list of people with thumbnails."""
+        from pathlib import Path
+
+        self.clear_browse_data()
+        known_dir = Path(known_faces_dir)
+
+        if not known_dir.exists():
+            return
+
+        for person_dir in sorted(known_dir.iterdir()):
+            if not person_dir.is_dir():
+                continue
+
+            name = person_dir.name
+            images = list(person_dir.glob("*.jpg")) + list(person_dir.glob("*.png"))
+            image_count = len(images)
+
+            if image_count == 0:
+                continue
+
+            # Load first image as thumbnail
+            thumbnail = cv2.imread(str(images[0]))
+            if thumbnail is None:
+                continue
+
+            # Resize thumbnail to square
+            h, w = thumbnail.shape[:2]
+            size = min(h, w)
+            y_off = (h - size) // 2
+            x_off = (w - size) // 2
+            thumbnail = thumbnail[y_off:y_off+size, x_off:x_off+size]
+            thumbnail = cv2.resize(thumbnail, (128, 128))
+
+            # Create texture
+            texture_id = self.texture_manager.create_browse_texture(thumbnail)
+
+            person_info = BrowsePersonInfo(
+                name=name,
+                image_count=image_count,
+                thumbnail=thumbnail,
+                texture_id=texture_id
+            )
+            self.state.browse_people.append(person_info)
+
+    def load_person_images(self, person_name: str, known_faces_dir: str = "known-faces"):
+        """Load all images for a specific person."""
+        from pathlib import Path
+
+        # Clear previous person images
+        self.state.browse_person_images.clear()
+
+        person_dir = Path(known_faces_dir) / person_name
+        if not person_dir.exists():
+            return
+
+        images = sorted(list(person_dir.glob("*.jpg")) + list(person_dir.glob("*.png")))
+
+        for img_path in images:
+            # Load and create texture
+            img = cv2.imread(str(img_path))
+            if img is None:
+                continue
+
+            # Resize for display
+            h, w = img.shape[:2]
+            size = min(h, w)
+            y_off = (h - size) // 2
+            x_off = (w - size) // 2
+            img = img[y_off:y_off+size, x_off:x_off+size]
+            img = cv2.resize(img, (128, 128))
+
+            texture_id = self.texture_manager.create_browse_texture(img)
+            self.state.browse_person_images.append((str(img_path), texture_id))
+
+        self.state.browse_selected_person = person_name
+
+    def delete_person_image(self, image_path: str):
+        """Delete an image from the filesystem."""
+        from pathlib import Path
+        import os
+
+        path = Path(image_path)
+        if path.exists():
+            os.remove(path)
+            print(f"Deleted: {image_path}")
+            return True
+        return False
+
+    def clear_browse_data(self):
+        """Clear browse mode state."""
+        self.texture_manager.clear_browse_textures()
+        self.state.browse_people.clear()
+        self.state.browse_selected_person = None
+        self.state.browse_person_images.clear()
+        self.state.browse_delete_confirmed = None
+
     def render_ui(self, faces: list = None):
         """Render the complete UI."""
         window_w, window_h = glfw.get_window_size(self.window)
+
+        # Browse mode has its own full-screen layout
+        if self.state.mode == "browse":
+            self._render_browse_mode(window_w, window_h)
+            return
 
         # Main menu bar height
         menu_bar_height = 0
@@ -502,6 +652,10 @@ class ImguiApp:
                 if imgui.button("Reload DB (R)", width=button_width):
                     self.state.action_reload_db = True
 
+            imgui.spacing()
+            if imgui.button("Browse Faces (B)", width=button_width):
+                self.state.action_browse_mode = True
+
         elif self.state.mode == "capture":
             imgui.text(f"Captured: {self.state.capture_count}")
             imgui.spacing()
@@ -581,11 +735,151 @@ class ImguiApp:
         if self.state.mode == "capture":
             help_text = "SPACE=capture  S=save  ESC=cancel"
         elif self.state.mode == "recognition":
-            help_text = "C=capture  R=reload  Q=quit  F11=fullscreen"
+            help_text = "C=capture  R=reload  B=browse  Q=quit  F11=fullscreen"
+        elif self.state.mode == "browse":
+            help_text = "ESC=back/close"
         else:
-            help_text = "C=capture  Q=quit  F11=fullscreen"
+            help_text = "C=capture  B=browse  Q=quit  F11=fullscreen"
 
         imgui.text_colored(help_text, 0.7, 0.7, 0.7)
+
+        imgui.end()
+
+    def _render_browse_mode(self, window_w: float, window_h: float):
+        """Render the browse faces mode."""
+        # If a person is selected, show their images
+        if self.state.browse_selected_person:
+            self._render_person_detail(window_w, window_h)
+            return
+
+        # Otherwise show the person grid
+        flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE |
+                imgui.WINDOW_NO_MOVE)
+
+        imgui.set_next_window_position(0, 0)
+        imgui.set_next_window_size(window_w, window_h)
+        imgui.begin("Browse Faces", flags=flags)
+
+        # Header
+        imgui.text_colored("BROWSE KNOWN FACES", 0.2, 0.8, 0.2)
+        imgui.same_line(spacing=40)
+        if imgui.button("Close (ESC)"):
+            self.state.action_exit_browse = True
+        imgui.separator()
+        imgui.spacing()
+
+        # Calculate grid layout
+        tile_size = int(160 * self.dpi_scale)
+        padding = int(10 * self.dpi_scale)
+        thumb_size = int(128 * self.dpi_scale)
+
+        available_width = window_w - int(40 * self.dpi_scale)
+        cols = max(1, int(available_width // (tile_size + padding)))
+
+        # Begin scrollable region
+        imgui.begin_child("PersonGrid", 0, 0, border=False)
+
+        for i, person in enumerate(self.state.browse_people):
+            col = i % cols
+
+            if col > 0:
+                imgui.same_line(spacing=padding)
+
+            # Person tile
+            imgui.begin_group()
+
+            # Thumbnail (clickable)
+            if person.texture_id:
+                clicked = imgui.image_button(
+                    person.texture_id, thumb_size, thumb_size,
+                    frame_padding=2
+                )
+                if clicked:
+                    self.load_person_images(person.name)
+
+            # Name and count below
+            imgui.text(person.name)
+            imgui.text_colored(f"{person.image_count} images", 0.6, 0.6, 0.6)
+
+            imgui.end_group()
+
+            # Add spacing after each row
+            if col == cols - 1:
+                imgui.spacing()
+
+        imgui.end_child()
+        imgui.end()
+
+    def _render_person_detail(self, window_w: float, window_h: float):
+        """Render detail view for a selected person."""
+        flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE |
+                imgui.WINDOW_NO_MOVE)
+
+        imgui.set_next_window_position(0, 0)
+        imgui.set_next_window_size(window_w, window_h)
+        imgui.begin("Person Detail", flags=flags)
+
+        # Header
+        person_name = self.state.browse_selected_person
+        imgui.text_colored(f"IMAGES: {person_name}", 0.2, 0.8, 0.2)
+        imgui.same_line(spacing=40)
+        if imgui.button("Back (ESC)"):
+            # Go back to person list
+            self.state.browse_selected_person = None
+            self.state.browse_person_images.clear()
+        imgui.separator()
+        imgui.spacing()
+
+        # Calculate grid layout
+        tile_size = int(160 * self.dpi_scale)
+        padding = int(10 * self.dpi_scale)
+        thumb_size = int(128 * self.dpi_scale)
+
+        available_width = window_w - int(40 * self.dpi_scale)
+        cols = max(1, int(available_width // (tile_size + padding)))
+
+        # Begin scrollable region
+        imgui.begin_child("ImageGrid", 0, 0, border=False)
+
+        # Track image to delete
+        delete_path = None
+
+        for i, (img_path, tex_id) in enumerate(self.state.browse_person_images):
+            col = i % cols
+
+            if col > 0:
+                imgui.same_line(spacing=padding)
+
+            # Image tile
+            imgui.begin_group()
+
+            # Thumbnail
+            if tex_id:
+                imgui.image(tex_id, thumb_size, thumb_size)
+
+            # Delete button
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.8, 0.2, 0.2, 1.0)
+            imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 1.0, 0.3, 0.3, 1.0)
+            if imgui.button(f"Delete##{i}", width=thumb_size):
+                delete_path = img_path
+            imgui.pop_style_color(2)
+
+            imgui.end_group()
+
+            # Add spacing after each row
+            if col == cols - 1:
+                imgui.spacing()
+
+        imgui.end_child()
+
+        # Handle deletion
+        if delete_path:
+            if self.delete_person_image(delete_path):
+                # Reload person images
+                self.texture_manager.clear_browse_textures()
+                # Reload browse data to update counts
+                self.load_browse_data()
+                self.load_person_images(person_name)
 
         imgui.end()
 
