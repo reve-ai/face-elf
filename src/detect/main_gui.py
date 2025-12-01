@@ -3,9 +3,12 @@
 import argparse
 import time
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple, Union
 
-from .camera import Camera, find_available_camera
+import numpy as np
+
+from .camera import Camera, ThreadedCamera, find_available_camera, get_supported_resolutions
+from .config import AppConfig
 from .detector import FaceDetector
 from .face_capture import FaceCaptureSession, find_central_face, crop_face, scale_to_normalized_size
 from .embedder import FaceEmbedder
@@ -97,6 +100,19 @@ def main():
 
     args = parser.parse_args()
 
+    # Load configuration
+    config = AppConfig()
+    config.load()
+
+    # Command-line args override config file
+    if args.width != 640 or args.height != 480:
+        # User specified custom resolution on command line
+        config.camera_resolution = (args.width, args.height)
+    if args.conf_threshold != 0.5:
+        config.conf_threshold = args.conf_threshold
+    if args.similarity_threshold != 0.4:
+        config.similarity_threshold = args.similarity_threshold
+
     # Find detection model
     if args.model:
         model_path = Path(args.model)
@@ -166,8 +182,24 @@ def main():
     else:
         device_id = args.camera
 
-    # Initialize camera
-    camera = Camera(device_id, args.width, args.height)
+    # Probe supported resolutions
+    print("Probing camera resolutions...")
+    available_resolutions = get_supported_resolutions(device_id)
+    if available_resolutions:
+        print(f"Supported resolutions: {available_resolutions}")
+    else:
+        # Fallback to common defaults
+        available_resolutions = [(640, 480), (1280, 720), (1920, 1080)]
+        print(f"Could not probe resolutions, using defaults: {available_resolutions}")
+
+    # Ensure configured resolution is in the list or use a fallback
+    if config.camera_resolution not in available_resolutions:
+        if available_resolutions:
+            config.camera_resolution = available_resolutions[0]
+            print(f"Configured resolution not available, using {config.camera_resolution}")
+
+    # Initialize camera with threaded capture
+    camera = ThreadedCamera(device_id, config.camera_width, config.camera_height)
     if not camera.open():
         print(f"Error: Could not open camera {device_id}")
         return 1
@@ -180,9 +212,11 @@ def main():
         return 1
 
     # Set initial state
-    app.state.conf_threshold = args.conf_threshold
-    app.state.similarity_threshold = args.similarity_threshold
+    app.state.conf_threshold = config.conf_threshold
+    app.state.similarity_threshold = config.similarity_threshold
     app.state.mode = "recognition" if recognition_enabled else "detection"
+    app.state.available_resolutions = available_resolutions
+    app.state.current_resolution = config.camera_resolution
     if face_db:
         app.state.known_faces_count = face_db.get_person_count()
 
@@ -192,17 +226,22 @@ def main():
     print("\nRunning face detection" + (" and recognition" if recognition_enabled else "") + " (GUI)...")
     print("Use the GUI buttons or keyboard shortcuts to control the application.")
 
-    # FPS tracking
-    fps = 0.0
-    frame_count = 0
-    fps_update_interval = 10
-    start_time = time.time()
+    # FPS tracking (UI frame rate)
+    ui_fps = 0.0
+    ui_frame_count = 0
+    ui_fps_update_interval = 30
+    ui_start_time = time.time()
+
+    # State for rendering (persists between frames)
+    current_frame: Optional[np.ndarray] = None
+    face_data_list: List[Dict[str, Any]] = []
 
     try:
         while not app.should_close():
             # Handle state changes from GUI
             _handle_state_actions(
-                app, capture_session, face_db, recognition_enabled
+                app, capture_session, face_db, recognition_enabled,
+                camera, config
             )
 
             # Browse modes - skip camera and detection
@@ -217,97 +256,104 @@ def main():
             if face_db:
                 face_db.similarity_threshold = app.state.similarity_threshold
 
-            # Capture frame
-            ret, frame = camera.read()
-            if not ret:
-                print("Error: Failed to capture frame")
-                break
+            # Get latest frame from camera (non-blocking)
+            ret, frame, is_new_frame = camera.get_latest_frame()
 
-            frame_h, frame_w = frame.shape[:2]
+            # Process new frames for face detection
+            if ret and is_new_frame and frame is not None:
+                current_frame = frame
+                frame_h, frame_w = frame.shape[:2]
 
-            # Detect faces
-            faces = detector.detect(frame)
+                # Detect faces
+                faces = detector.detect(frame)
 
-            # Process faces and build face data for rendering
-            face_data_list: List[Dict[str, Any]] = []
+                # Process faces and build face data for rendering
+                face_data_list = []
 
-            if app.state.mode == "capture":
-                # Find central face
-                central_face = find_central_face(faces, frame_w, frame_h)
+                if app.state.mode == "capture":
+                    # Find central face
+                    central_face = find_central_face(faces, frame_w, frame_h)
 
-                for face in faces:
-                    is_central = (face is central_face)
-                    face_data_list.append({
-                        'face': face,
-                        'name': None,
-                        'similarity': 0,
-                        'is_central': is_central
-                    })
+                    for face in faces:
+                        is_central = (face is central_face)
+                        face_data_list.append({
+                            'face': face,
+                            'name': None,
+                            'similarity': 0,
+                            'is_central': is_central
+                        })
 
-            elif recognition_enabled and embedder and face_db:
-                # Recognition mode
-                for face in faces:
-                    cropped = crop_face(frame, face)
-                    if cropped is None:
+                elif recognition_enabled and embedder and face_db:
+                    # Recognition mode
+                    for face in faces:
+                        cropped = crop_face(frame, face)
+                        if cropped is None:
+                            face_data_list.append({
+                                'face': face,
+                                'name': None,
+                                'similarity': 0,
+                                'is_central': False
+                            })
+                            continue
+
+                        normalized = scale_to_normalized_size(cropped, 384)
+                        embedding = embedder.get_embedding(normalized)
+                        name, similarity = face_db.find_match(embedding)
+
+                        face_data_list.append({
+                            'face': face,
+                            'name': name,
+                            'similarity': similarity,
+                            'is_central': False
+                        })
+
+                        # Save unknown faces (only if bounding box area >= 12000 pixels)
+                        if name is None and unknown_tracker:
+                            bbox_w = face.bbox[2] - face.bbox[0]
+                            bbox_h = face.bbox[3] - face.bbox[1]
+                            if bbox_w * bbox_h >= 12000:
+                                unknown_tracker.maybe_save_face(normalized)
+
+                else:
+                    # Detection only
+                    for face in faces:
                         face_data_list.append({
                             'face': face,
                             'name': None,
                             'similarity': 0,
                             'is_central': False
                         })
-                        continue
 
-                    normalized = scale_to_normalized_size(cropped, 384)
-                    embedding = embedder.get_embedding(normalized)
-                    name, similarity = face_db.find_match(embedding)
+                # Handle capture face action (needs frame and faces)
+                if app.state.mode == "capture" and app.state.action_capture_face:
+                    central_face = find_central_face(faces, frame_w, frame_h)
+                    if central_face:
+                        captured = capture_session.capture_face(frame, central_face)
+                        if captured:
+                            thumbnail = capture_session.captures[-1].thumbnail
+                            app.add_capture_thumbnail(thumbnail)
+                            print(f"Captured face #{capture_session.get_capture_count()}")
+                    else:
+                        print("No face detected to capture")
+                    app.state.action_capture_face = False
 
-                    face_data_list.append({
-                        'face': face,
-                        'name': name,
-                        'similarity': similarity,
-                        'is_central': False
-                    })
+            # Update UI FPS (tracks render rate, not camera rate)
+            ui_frame_count += 1
+            if ui_frame_count % ui_fps_update_interval == 0:
+                elapsed = time.time() - ui_start_time
+                ui_fps = ui_frame_count / elapsed
+                # Combine UI FPS with camera FPS for display
+                camera_fps = camera.get_capture_fps()
+                app.state.fps = ui_fps
+                app.state.camera_fps = camera_fps
+                if ui_frame_count >= 300:
+                    ui_frame_count = 0
+                    ui_start_time = time.time()
 
-                    # Save unknown faces
-                    if name is None and unknown_tracker:
-                        unknown_tracker.maybe_save_face(normalized)
-
-            else:
-                # Detection only
-                for face in faces:
-                    face_data_list.append({
-                        'face': face,
-                        'name': None,
-                        'similarity': 0,
-                        'is_central': False
-                    })
-
-            # Handle capture face action (needs frame and faces)
-            if app.state.mode == "capture" and app.state.action_capture_face:
-                central_face = find_central_face(faces, frame_w, frame_h)
-                if central_face:
-                    captured = capture_session.capture_face(frame, central_face)
-                    if captured:
-                        thumbnail = capture_session.captures[-1].thumbnail
-                        app.add_capture_thumbnail(thumbnail)
-                        print(f"Captured face #{capture_session.get_capture_count()}")
-                else:
-                    print("No face detected to capture")
-                app.state.action_capture_face = False
-
-            # Update FPS
-            frame_count += 1
-            if frame_count % fps_update_interval == 0:
-                elapsed = time.time() - start_time
-                fps = frame_count / elapsed
-                app.state.fps = fps
-                if frame_count >= 100:
-                    frame_count = 0
-                    start_time = time.time()
-
-            # Render GUI
+            # Render GUI (always, even without new frame)
             app.begin_frame()
-            app.update_video(frame)
+            if current_frame is not None:
+                app.update_video(current_frame)
             app.render_ui(face_data_list)
             app.end_frame()
 
@@ -326,7 +372,9 @@ def _handle_state_actions(
     app: ImguiApp,
     capture_session: FaceCaptureSession,
     face_db: Optional[FaceDatabase],
-    recognition_enabled: bool
+    recognition_enabled: bool,
+    camera: Union[Camera, ThreadedCamera],
+    config: AppConfig
 ):
     """Handle state actions triggered by GUI."""
     state = app.state
@@ -335,6 +383,15 @@ def _handle_state_actions(
     if state.action_toggle_fullscreen:
         app.toggle_fullscreen()
         state.action_toggle_fullscreen = False
+
+    # Change camera resolution
+    if state.action_change_resolution is not None:
+        new_res = state.action_change_resolution
+        state.action_change_resolution = None
+        if camera.set_resolution(new_res[0], new_res[1]):
+            state.current_resolution = new_res
+            config.camera_resolution = new_res
+            config.save()
 
     # Enter capture mode
     if state.action_capture_mode:

@@ -49,8 +49,14 @@ class AppState:
     conf_threshold: float = 0.5
     similarity_threshold: float = 0.4
 
+    # Camera resolution
+    available_resolutions: List[Tuple[int, int]] = field(default_factory=list)
+    current_resolution: Tuple[int, int] = (640, 480)
+    selected_resolution_idx: int = 0
+
     # Stats
-    fps: float = 0.0
+    fps: float = 0.0  # UI frame rate
+    camera_fps: float = 0.0  # Camera capture rate
     known_faces_count: int = 0
 
     # Capture mode
@@ -83,6 +89,13 @@ class AppState:
     action_exit_browse: bool = False
     action_unknown_browse_mode: bool = False
     action_exit_unknown_browse: bool = False
+    action_change_resolution: Optional[Tuple[int, int]] = None
+
+    # Pending refresh actions (deferred to avoid texture issues during render)
+    pending_refresh_unknown_browse: bool = False
+    pending_refresh_browse: bool = False
+    pending_refresh_browse_person: Optional[str] = None
+    pending_refresh_unknown_day: Optional[str] = None
 
 
 class TextureManager:
@@ -369,7 +382,46 @@ class ImguiApp:
         """Begin a new frame."""
         glfw.poll_events()
         self.impl.process_inputs()
+
+        # Process pending refresh actions (deferred from previous frame)
+        self._process_pending_refreshes()
+
         imgui.new_frame()
+
+    def _process_pending_refreshes(self):
+        """Process any pending refresh actions from the previous frame."""
+        if self.state.pending_refresh_unknown_browse:
+            self.state.pending_refresh_unknown_browse = False
+            self.texture_manager.clear_browse_textures()
+            self.load_unknown_faces_data()
+
+        if self.state.pending_refresh_unknown_day is not None:
+            folder_path = self.state.pending_refresh_unknown_day
+            self.state.pending_refresh_unknown_day = None
+            self.texture_manager.clear_browse_textures()
+            self.load_unknown_faces_data()
+            # Check if folder still exists and has images
+            from pathlib import Path
+            if folder_path and Path(folder_path).exists():
+                images = list(Path(folder_path).glob("*.jpg")) + list(Path(folder_path).glob("*.png"))
+                if images:
+                    self.load_unknown_day_images(folder_path)
+                else:
+                    self.state.unknown_selected_day = None
+            else:
+                self.state.unknown_selected_day = None
+
+        if self.state.pending_refresh_browse:
+            self.state.pending_refresh_browse = False
+            self.texture_manager.clear_browse_textures()
+            self.load_browse_data()
+
+        if self.state.pending_refresh_browse_person is not None:
+            person_name = self.state.pending_refresh_browse_person
+            self.state.pending_refresh_browse_person = None
+            self.texture_manager.clear_browse_textures()
+            self.load_browse_data()
+            self.load_person_images(person_name)
 
     def end_frame(self):
         """End frame and render."""
@@ -758,13 +810,16 @@ class ImguiApp:
             if face is None:
                 continue
 
-            x1, y1, x2, y2 = face.bbox
+            # Get original bbox coordinates (before scaling)
+            orig_x1, orig_y1, orig_x2, orig_y2 = face.bbox
+            bbox_w = int(orig_x2 - orig_x1)
+            bbox_h = int(orig_y2 - orig_y1)
 
-            # Scale and offset
-            x1 = img_pos[0] + x1 * scale
-            y1 = img_pos[1] + y1 * scale
-            x2 = img_pos[0] + x2 * scale
-            y2 = img_pos[1] + y2 * scale
+            # Scale and offset for display
+            x1 = img_pos[0] + orig_x1 * scale
+            y1 = img_pos[1] + orig_y1 * scale
+            x2 = img_pos[0] + orig_x2 * scale
+            y2 = img_pos[1] + orig_y2 * scale
 
             # Determine color
             if is_central:
@@ -795,6 +850,12 @@ class ImguiApp:
             text_color = imgui.get_color_u32_rgba(1, 1, 1, 1)
             draw_list.add_text(x1 + 4 * self.dpi_scale, y1 - label_h + 2 * self.dpi_scale, text_color, label)
 
+            # Draw dimensions below the box
+            dim_label = f"{bbox_w}x{bbox_h}"
+            dim_label_w = len(dim_label) * 8 * self.dpi_scale + 8 * self.dpi_scale
+            draw_list.add_rect_filled(x1, y2, x1 + dim_label_w, y2 + label_h, bg_color)
+            draw_list.add_text(x1 + 4 * self.dpi_scale, y2 + 2 * self.dpi_scale, text_color, dim_label)
+
             # Draw landmarks if available
             if hasattr(face, 'landmarks') and face.landmarks is not None:
                 landmark_color = color
@@ -822,12 +883,32 @@ class ImguiApp:
         imgui.separator()
 
         # Stats
-        imgui.text(f"FPS: {self.state.fps:.1f}")
+        imgui.text(f"UI: {self.state.fps:.0f} fps")
+        imgui.same_line()
+        imgui.text_colored(f"Cam: {self.state.camera_fps:.0f} fps", 0.6, 0.8, 1.0)
         if self.state.mode == "recognition":
             imgui.text(f"Known faces: {self.state.known_faces_count}")
 
         imgui.separator()
         imgui.spacing()
+
+        # Camera resolution selector
+        if self.state.available_resolutions:
+            imgui.text("Camera Resolution")
+            current_res = self.state.current_resolution
+            preview = f"{current_res[0]}x{current_res[1]}"
+            imgui.set_next_item_width(width - int(30 * self.dpi_scale))
+            if imgui.begin_combo("##resolution", preview):
+                for i, (w, h) in enumerate(self.state.available_resolutions):
+                    is_selected = (w, h) == current_res
+                    label = f"{w}x{h}"
+                    if imgui.selectable(label, is_selected)[0]:
+                        if (w, h) != current_res:
+                            self.state.action_change_resolution = (w, h)
+                    if is_selected:
+                        imgui.set_item_default_focus()
+                imgui.end_combo()
+            imgui.spacing()
 
         # Sliders
         imgui.text("Detection Confidence")
@@ -1083,14 +1164,10 @@ class ImguiApp:
 
         imgui.end_child()
 
-        # Handle deletion
+        # Handle deletion (defer refresh to next frame)
         if delete_path:
             if self.delete_person_image(delete_path):
-                # Reload person images
-                self.texture_manager.clear_browse_textures()
-                # Reload browse data to update counts
-                self.load_browse_data()
-                self.load_person_images(person_name)
+                self.state.pending_refresh_browse_person = person_name
 
         imgui.end()
 
@@ -1130,8 +1207,7 @@ class ImguiApp:
             imgui.spacing()
             if imgui.button("Yes, Delete All", width=150):
                 self.delete_all_unknown_faces()
-                self.texture_manager.clear_browse_textures()
-                self.load_unknown_faces_data()
+                self.state.pending_refresh_unknown_browse = True
                 imgui.close_current_popup()
             imgui.same_line()
             if imgui.button("Cancel", width=150):
@@ -1196,11 +1272,10 @@ class ImguiApp:
 
         imgui.end_child()
 
-        # Handle day deletion
+        # Handle day deletion (defer refresh to next frame)
         if delete_folder:
             self.delete_unknown_day(delete_folder)
-            self.texture_manager.clear_browse_textures()
-            self.load_unknown_faces_data()
+            self.state.pending_refresh_unknown_browse = True
 
         imgui.end()
 
@@ -1384,21 +1459,8 @@ class ImguiApp:
             self.state.unknown_move_target = ""
 
     def _refresh_unknown_day_view(self):
-        """Refresh the current unknown day view."""
-        folder_path = self.state.unknown_selected_day
-        self.texture_manager.clear_browse_textures()
-        self.load_unknown_faces_data()
-        # Check if folder still exists and has images
-        from pathlib import Path
-        if folder_path and Path(folder_path).exists():
-            images = list(Path(folder_path).glob("*.jpg")) + list(Path(folder_path).glob("*.png"))
-            if images:
-                self.load_unknown_day_images(folder_path)
-            else:
-                # Folder is empty, go back to day list
-                self.state.unknown_selected_day = None
-        else:
-            self.state.unknown_selected_day = None
+        """Schedule refresh of the current unknown day view (deferred to next frame)."""
+        self.state.pending_refresh_unknown_day = self.state.unknown_selected_day
 
     def shutdown(self):
         """Clean up resources."""
