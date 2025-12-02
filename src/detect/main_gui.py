@@ -2,9 +2,11 @@
 
 import argparse
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple, Union
 
+import cv2
 import numpy as np
 
 from .camera import Camera, ThreadedCamera, find_available_camera, get_supported_resolutions
@@ -98,6 +100,11 @@ def main():
         type=int,
         default=900,
         help="Initial window height"
+    )
+    parser.add_argument(
+        "--elf-mode",
+        action="store_true",
+        help="Start immediately in elf mode"
     )
 
     args = parser.parse_args()
@@ -224,6 +231,15 @@ def main():
 
     # Initialize capture session
     capture_session = FaceCaptureSession()
+
+    # Enter elf mode immediately if requested
+    if args.elf_mode:
+        print("Starting in elf mode...")
+        if app.create_elf_window():
+            app.state.elf_mode_active = True
+            app.state.elf_last_generation_time = 0.0  # Allow immediate generation
+        else:
+            print("Warning: Failed to create elf window")
 
     print("\nRunning face detection" + (" and recognition" if recognition_enabled else "") + " (GUI)...")
     print("Use the GUI buttons or keyboard shortcuts to control the application.")
@@ -551,6 +567,32 @@ def _try_capture_face(
 _elf_future: Optional[Future] = None
 
 
+def _save_elf_image(elf_image: np.ndarray) -> Optional[Path]:
+    """Save elf image to elf-pictures/YYYY-MM-DD/YYYY-MM-DD-HH-MM-SS.png.
+
+    Returns the path where the image was saved, or None if failed.
+    """
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    timestamp_str = now.strftime("%Y-%m-%d-%H-%M-%S")
+
+    # Create directory structure
+    elf_dir = Path("elf-pictures") / date_str
+    elf_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save image
+    filename = f"{timestamp_str}.png"
+    filepath = elf_dir / filename
+
+    try:
+        cv2.imwrite(str(filepath), elf_image)
+        print(f"Saved elf image to {filepath}")
+        return filepath
+    except Exception as e:
+        print(f"Failed to save elf image: {e}")
+        return None
+
+
 def _check_elf_generation_result(app: ImguiApp) -> bool:
     """Check if async elf generation has completed and handle the result.
 
@@ -570,6 +612,7 @@ def _check_elf_generation_result(app: ImguiApp) -> bool:
         elf_image = _elf_future.result()
         if elf_image is not None:
             app.update_elf_window_image(elf_image)
+            _save_elf_image(elf_image)
             print("Elf image generated successfully!")
         else:
             print("Failed to generate elf image")
