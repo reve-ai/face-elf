@@ -97,6 +97,15 @@ class AppState:
     pending_refresh_browse_person: Optional[str] = None
     pending_refresh_unknown_day: Optional[str] = None
 
+    # Elf mode
+    action_elf_mode: bool = False
+    action_exit_elf_mode: bool = False
+    elf_mode_active: bool = False
+    elf_last_generation_time: float = 0.0
+    elf_generation_interval: float = 15.0  # seconds between generations
+    elf_min_face_pixels: int = 20000  # minimum face area to trigger generation
+    elf_generation_pending: bool = False  # True when async generation is in progress
+
 
 class TextureManager:
     """Manages OpenGL textures for video frames and thumbnails."""
@@ -106,6 +115,8 @@ class TextureManager:
         self.video_size: Tuple[int, int] = (0, 0)
         self.thumbnail_textures: List[int] = []
         self.browse_textures: List[int] = []  # For browse mode
+        self.elf_texture: Optional[int] = None
+        self.elf_size: Tuple[int, int] = (0, 0)
 
     def update_video_texture(self, frame: np.ndarray) -> int:
         """Update or create video texture from BGR frame."""
@@ -174,12 +185,45 @@ class TextureManager:
             gl.glDeleteTextures(len(self.browse_textures), self.browse_textures)
             self.browse_textures.clear()
 
+    def update_elf_texture(self, frame: np.ndarray) -> int:
+        """Update or create elf texture from BGR frame."""
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        if self.elf_texture is None or self.elf_size != (w, h):
+            # Create new texture
+            if self.elf_texture is not None:
+                gl.glDeleteTextures(1, [self.elf_texture])
+
+            self.elf_texture = gl.glGenTextures(1)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self.elf_texture)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB, w, h, 0,
+                           gl.GL_RGB, gl.GL_UNSIGNED_BYTE, rgb)
+            self.elf_size = (w, h)
+        else:
+            # Update existing texture
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self.elf_texture)
+            gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, w, h,
+                              gl.GL_RGB, gl.GL_UNSIGNED_BYTE, rgb)
+
+        return self.elf_texture
+
+    def clear_elf_texture(self):
+        """Delete elf texture."""
+        if self.elf_texture is not None:
+            gl.glDeleteTextures(1, [self.elf_texture])
+            self.elf_texture = None
+            self.elf_size = (0, 0)
+
     def cleanup(self):
         """Clean up all textures."""
         if self.video_texture is not None:
             gl.glDeleteTextures(1, [self.video_texture])
         self.clear_thumbnails()
         self.clear_browse_textures()
+        self.clear_elf_texture()
 
 
 class ImguiApp:
@@ -200,6 +244,11 @@ class ImguiApp:
 
         # Thumbnail texture IDs (parallel to state.capture_thumbnails)
         self.thumbnail_texture_ids: List[int] = []
+
+        # Separate elf mode window
+        self.elf_window = None
+        self.elf_impl = None
+        self.elf_texture_manager: Optional[TextureManager] = None
 
     def init(self) -> bool:
         """Initialize GLFW and imgui."""
@@ -320,7 +369,9 @@ class ImguiApp:
         elif key == glfw.KEY_F11:
             self.state.action_toggle_fullscreen = True
         elif key == glfw.KEY_ESCAPE:
-            if self.state.mode == "capture":
+            if self.state.elf_mode_active:
+                self.state.action_exit_elf_mode = True
+            elif self.state.mode == "capture":
                 self.state.action_cancel_capture = True
             elif self.state.mode == "browse":
                 self.state.action_exit_browse = True
@@ -343,6 +394,8 @@ class ImguiApp:
                 self.state.action_browse_mode = True
             elif key == glfw.KEY_U:
                 self.state.action_unknown_browse_mode = True
+            elif key == glfw.KEY_E:
+                self.state.action_elf_mode = True
 
         elif self.state.mode == "capture":
             if key == glfw.KEY_SPACE:
@@ -373,6 +426,202 @@ class ImguiApp:
             glfw.set_window_monitor(self.window, monitor, 0, 0,
                                    mode.size.width, mode.size.height, mode.refresh_rate)
             self.is_fullscreen = True
+
+    def create_elf_window(self) -> bool:
+        """Create a separate fullscreen window for elf mode."""
+        if self.elf_window is not None:
+            return True  # Already created
+
+        # Get primary monitor for fullscreen
+        monitor = glfw.get_primary_monitor()
+        mode = glfw.get_video_mode(monitor)
+
+        # Window hints for elf window
+        glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+        glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+        glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+        glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, gl.GL_TRUE)
+        glfw.window_hint(glfw.DECORATED, glfw.FALSE)  # No window decorations
+
+        # Create fullscreen window
+        self.elf_window = glfw.create_window(
+            mode.size.width, mode.size.height,
+            "Elf Mode",
+            monitor,  # Fullscreen on primary monitor
+            self.window  # Share context with main window
+        )
+
+        if not self.elf_window:
+            print("Failed to create elf window")
+            return False
+
+        # Set up elf window context
+        glfw.make_context_current(self.elf_window)
+        glfw.swap_interval(1)
+
+        # Create separate imgui renderer for elf window
+        self.elf_impl = GlfwRenderer(self.elf_window, attach_callbacks=False)
+
+        # Create separate texture manager for elf window
+        self.elf_texture_manager = TextureManager()
+
+        # Set key callback for elf window
+        glfw.set_key_callback(self.elf_window, self._elf_key_callback)
+
+        # Restore main window context
+        glfw.make_context_current(self.window)
+
+        print(f"Created elf window: {mode.size.width}x{mode.size.height}")
+        return True
+
+    def destroy_elf_window(self):
+        """Destroy the elf mode window."""
+        if self.elf_window is None:
+            return
+
+        # Switch to elf window context to clean up textures
+        glfw.make_context_current(self.elf_window)
+
+        if self.elf_texture_manager:
+            self.elf_texture_manager.cleanup()
+            self.elf_texture_manager = None
+
+        if self.elf_impl:
+            self.elf_impl.shutdown()
+            self.elf_impl = None
+
+        # Restore main window context before destroying
+        glfw.make_context_current(self.window)
+
+        glfw.destroy_window(self.elf_window)
+        self.elf_window = None
+        print("Destroyed elf window")
+
+    def _elf_key_callback(self, window, key, scancode, action, mods):
+        """Handle keyboard input for elf window."""
+        if action != glfw.PRESS:
+            return
+
+        # ESC exits elf mode
+        if key == glfw.KEY_ESCAPE:
+            self.state.action_exit_elf_mode = True
+
+    def update_elf_window_image(self, frame: np.ndarray):
+        """Update the elf image in the separate elf window."""
+        if self.elf_window is None or self.elf_texture_manager is None:
+            return
+
+        # Switch to elf window context
+        glfw.make_context_current(self.elf_window)
+
+        # Update texture
+        self.elf_texture_manager.update_elf_texture(frame)
+
+        # Restore main window context
+        glfw.make_context_current(self.window)
+
+    def render_elf_window(self):
+        """Render the elf mode window."""
+        if self.elf_window is None or self.elf_impl is None:
+            return
+
+        # Check if elf window was closed
+        if glfw.window_should_close(self.elf_window):
+            self.state.action_exit_elf_mode = True
+            return
+
+        # Switch to elf window context
+        glfw.make_context_current(self.elf_window)
+
+        # Poll events and process inputs for elf window
+        self.elf_impl.process_inputs()
+
+        # Get window size
+        window_w, window_h = glfw.get_window_size(self.elf_window)
+
+        # Begin imgui frame
+        imgui.new_frame()
+
+        # Render fullscreen elf content
+        self._render_elf_fullscreen(window_w, window_h)
+
+        # End frame and render
+        imgui.render()
+
+        display_w, display_h = glfw.get_framebuffer_size(self.elf_window)
+        gl.glViewport(0, 0, display_w, display_h)
+        gl.glClearColor(0.02, 0.02, 0.02, 1.0)
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+
+        self.elf_impl.render(imgui.get_draw_data())
+        glfw.swap_buffers(self.elf_window)
+
+        # Restore main window context
+        glfw.make_context_current(self.window)
+
+    def _render_elf_fullscreen(self, window_w: float, window_h: float):
+        """Render the elf mode fullscreen content."""
+        flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE |
+                imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_SCROLLBAR |
+                imgui.WINDOW_NO_COLLAPSE | imgui.WINDOW_NO_BACKGROUND)
+
+        imgui.set_next_window_position(0, 0)
+        imgui.set_next_window_size(window_w, window_h)
+
+        imgui.begin("Elf Fullscreen", flags=flags)
+
+        # Display elf image if available
+        if self.elf_texture_manager and self.elf_texture_manager.elf_texture is not None:
+            # Calculate scaled size to fit while maintaining aspect ratio
+            tex_w, tex_h = self.elf_texture_manager.elf_size
+            available_w = window_w
+            available_h = window_h - 80  # Leave room for status
+
+            scale = min(available_w / tex_w, available_h / tex_h)
+            display_w = int(tex_w * scale)
+            display_h = int(tex_h * scale)
+
+            # Center the image
+            cursor_x = (window_w - display_w) / 2
+            cursor_y = (window_h - display_h) / 2
+            imgui.set_cursor_pos((cursor_x, cursor_y))
+
+            imgui.image(self.elf_texture_manager.elf_texture, display_w, display_h)
+        else:
+            # Show waiting message centered
+            imgui.set_cursor_pos((window_w / 2 - 200, window_h / 2 - 60))
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.2, 0.8, 0.2, 1.0)
+            imgui.text("ELF MODE ACTIVE")
+            imgui.pop_style_color()
+
+            imgui.set_cursor_pos((window_w / 2 - 250, window_h / 2))
+            imgui.text("Waiting for a face large enough to transform...")
+
+            imgui.set_cursor_pos((window_w / 2 - 200, window_h / 2 + 40))
+            imgui.text_colored("(Face must be at least 20,000 pixels)", 0.6, 0.6, 0.6)
+
+        # Show generation status at bottom center
+        imgui.set_cursor_pos((window_w / 2 - 150, window_h - 50))
+        time_since_last = time.time() - self.state.elf_last_generation_time
+        time_until_next = max(0, self.state.elf_generation_interval - time_since_last)
+        if self.state.elf_generation_pending:
+            imgui.text_colored("Generating elf image...", 1.0, 0.8, 0.2)
+        elif time_until_next > 0:
+            imgui.text_colored(f"Next generation in: {time_until_next:.1f}s", 0.6, 0.6, 0.6)
+        else:
+            imgui.text_colored("Ready to generate...", 0.2, 0.8, 0.2)
+
+        # Exit button at bottom right
+        button_w = 150
+        button_h = 30
+        imgui.set_cursor_pos((window_w - button_w - 20, window_h - button_h - 20))
+        imgui.push_style_color(imgui.COLOR_BUTTON, 0.3, 0.3, 0.3, 0.8)
+        imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.5, 0.3, 0.3, 0.9)
+        if imgui.button("Press ESC to exit", width=button_w, height=button_h):
+            self.state.action_exit_elf_mode = True
+        imgui.pop_style_color(2)
+
+        imgui.end()
 
     def should_close(self) -> bool:
         """Check if window should close."""
@@ -439,6 +688,10 @@ class ImguiApp:
     def update_video(self, frame: np.ndarray):
         """Update video texture with new frame."""
         self.texture_manager.update_video_texture(frame)
+
+    def update_elf_image(self, frame: np.ndarray):
+        """Update elf mode image texture."""
+        self.texture_manager.update_elf_texture(frame)
 
     def add_capture_thumbnail(self, thumbnail: np.ndarray):
         """Add a new capture thumbnail."""
@@ -761,6 +1014,71 @@ class ImguiApp:
         imgui.set_next_window_size(window_w, status_bar_height)
         self._render_status_bar(window_w, status_bar_height)
 
+    def _render_elf_overlay(self, window_w: float, window_h: float):
+        """Render the elf mode fullscreen overlay."""
+        flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE |
+                imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_SCROLLBAR |
+                imgui.WINDOW_NO_COLLAPSE)
+
+        imgui.set_next_window_position(0, 0)
+        imgui.set_next_window_size(window_w, window_h)
+
+        # Dark background overlay
+        imgui.push_style_color(imgui.COLOR_WINDOW_BACKGROUND, 0.05, 0.05, 0.05, 0.98)
+
+        imgui.begin("Elf Mode", flags=flags)
+
+        # Display elf image if available
+        if self.texture_manager.elf_texture is not None:
+            # Calculate scaled size to fit while maintaining aspect ratio
+            tex_w, tex_h = self.texture_manager.elf_size
+            available_w = window_w - 40
+            available_h = window_h - 100  # Leave room for exit button
+
+            scale = min(available_w / tex_w, available_h / tex_h)
+            display_w = int(tex_w * scale)
+            display_h = int(tex_h * scale)
+
+            # Center the image
+            cursor_x = (window_w - display_w) / 2
+            cursor_y = (window_h - display_h - 60) / 2 + 20  # Offset for button room
+            imgui.set_cursor_pos((cursor_x, cursor_y))
+
+            imgui.image(self.texture_manager.elf_texture, display_w, display_h)
+        else:
+            # Show waiting message
+            imgui.set_cursor_pos((window_w / 2 - 150, window_h / 2 - 50))
+            imgui.text_colored("ELF MODE ACTIVE", 0.2, 0.8, 0.2)
+            imgui.set_cursor_pos((window_w / 2 - 200, window_h / 2))
+            imgui.text("Waiting for a face large enough to transform...")
+            imgui.set_cursor_pos((window_w / 2 - 150, window_h / 2 + 30))
+            imgui.text_colored("(Face must be at least 20,000 pixels)", 0.6, 0.6, 0.6)
+
+        # Exit button in lower-right corner
+        button_w = int(100 * self.dpi_scale)
+        button_h = int(40 * self.dpi_scale)
+        button_x = window_w - button_w - 20
+        button_y = window_h - button_h - 20
+
+        imgui.set_cursor_pos((button_x, button_y))
+        imgui.push_style_color(imgui.COLOR_BUTTON, 0.6, 0.1, 0.1, 1.0)
+        imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.8, 0.2, 0.2, 1.0)
+        if imgui.button("Exit (ESC)", width=button_w, height=button_h):
+            self.state.action_exit_elf_mode = True
+        imgui.pop_style_color(2)
+
+        # Show generation status in lower-left
+        imgui.set_cursor_pos((20, window_h - 40))
+        time_since_last = time.time() - self.state.elf_last_generation_time
+        time_until_next = max(0, self.state.elf_generation_interval - time_since_last)
+        if time_until_next > 0:
+            imgui.text_colored(f"Next generation in: {time_until_next:.1f}s", 0.6, 0.6, 0.6)
+        else:
+            imgui.text_colored("Ready to generate...", 0.2, 0.8, 0.2)
+
+        imgui.end()
+        imgui.pop_style_color()  # Window background
+
     def _render_video_panel(self, width: float, height: float, faces: list = None):
         """Render the video panel with face overlays."""
         flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE |
@@ -946,6 +1264,21 @@ class ImguiApp:
             if imgui.button("Unknown Faces (U)", width=button_width):
                 self.state.action_unknown_browse_mode = True
 
+            imgui.spacing()
+            imgui.separator()
+            imgui.spacing()
+
+            # Elf mode button with festive color
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.1, 0.5, 0.1, 1.0)
+            imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.2, 0.7, 0.2, 1.0)
+            if imgui.button("Elf Mode (E)", width=button_width):
+                self.state.action_elf_mode = True
+            imgui.pop_style_color(2)
+
+            # Show elf mode status if active
+            if self.state.elf_mode_active:
+                imgui.text_colored("Elf Mode ACTIVE", 0.2, 0.8, 0.2)
+
         elif self.state.mode == "capture":
             imgui.text(f"Captured: {self.state.capture_count}")
             imgui.spacing()
@@ -1025,13 +1358,13 @@ class ImguiApp:
         if self.state.mode == "capture":
             help_text = "SPACE=capture  S=save  ESC=cancel"
         elif self.state.mode == "recognition":
-            help_text = "C=capture  R=reload  B=browse  U=unknown  Q=quit  F11=fullscreen"
+            help_text = "C=capture  R=reload  B=browse  U=unknown  E=elf  Q=quit  F11=fullscreen"
         elif self.state.mode == "browse":
             help_text = "ESC=back/close"
         elif self.state.mode == "unknown_browse":
             help_text = "Click to select  ESC=back/close"
         else:
-            help_text = "C=capture  B=browse  U=unknown  Q=quit  F11=fullscreen"
+            help_text = "C=capture  B=browse  U=unknown  E=elf  Q=quit  F11=fullscreen"
 
         imgui.text_colored(help_text, 0.7, 0.7, 0.7)
 
@@ -1464,6 +1797,9 @@ class ImguiApp:
 
     def shutdown(self):
         """Clean up resources."""
+        # Clean up elf window first
+        self.destroy_elf_window()
+
         self.texture_manager.cleanup()
         if self.impl:
             self.impl.shutdown()

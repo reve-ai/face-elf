@@ -14,6 +14,8 @@ from .face_capture import FaceCaptureSession, find_central_face, crop_face, scal
 from .embedder import FaceEmbedder
 from .face_database import FaceDatabase, UnknownFaceTracker
 from .gui.app import ImguiApp, AppState
+from .generate import generate_elf_async, shutdown_executor
+from concurrent.futures import Future
 
 
 def get_model_path() -> Path:
@@ -337,6 +339,13 @@ def main():
                         print("No face detected to capture")
                     app.state.action_capture_face = False
 
+                # Handle elf mode generation (needs frame and faces)
+                if app.state.elf_mode_active and faces:
+                    _try_elf_generation(app, frame, faces, frame_h, frame_w)
+
+            # Check for completed async elf generation
+            _check_elf_generation_result(app)
+
             # Update UI FPS (tracks render rate, not camera rate)
             ui_frame_count += 1
             if ui_frame_count % ui_fps_update_interval == 0:
@@ -357,11 +366,16 @@ def main():
             app.render_ui(face_data_list)
             app.end_frame()
 
+            # Render elf window if active (separate from main window)
+            if app.state.elf_mode_active and app.elf_window is not None:
+                app.render_elf_window()
+
     except KeyboardInterrupt:
         print("\nInterrupted by user")
 
     finally:
         camera.release()
+        shutdown_executor()
         app.shutdown()
 
     print("Done")
@@ -491,6 +505,23 @@ def _handle_state_actions(
                 app.state.known_faces_count = face_db.get_person_count()
         state.action_exit_unknown_browse = False
 
+    # Enter elf mode
+    if state.action_elf_mode:
+        print("Entering elf mode")
+        if app.create_elf_window():
+            state.elf_mode_active = True
+            state.elf_last_generation_time = 0.0  # Allow immediate generation
+        else:
+            print("Failed to create elf window")
+        state.action_elf_mode = False
+
+    # Exit elf mode
+    if state.action_exit_elf_mode:
+        print("Exiting elf mode")
+        state.elf_mode_active = False
+        app.destroy_elf_window()
+        state.action_exit_elf_mode = False
+
 
 # Handle capture face action in main loop
 def _try_capture_face(
@@ -514,6 +545,121 @@ def _try_capture_face(
     else:
         print("No face detected to capture")
     return False
+
+
+# Module-level Future for async elf generation
+_elf_future: Optional[Future] = None
+
+
+def _check_elf_generation_result(app: ImguiApp) -> bool:
+    """Check if async elf generation has completed and handle the result.
+
+    Returns True if a result was processed.
+    """
+    global _elf_future
+    state = app.state
+
+    if _elf_future is None or not state.elf_generation_pending:
+        return False
+
+    if not _elf_future.done():
+        return False
+
+    # Get the result
+    try:
+        elf_image = _elf_future.result()
+        if elf_image is not None:
+            app.update_elf_window_image(elf_image)
+            print("Elf image generated successfully!")
+        else:
+            print("Failed to generate elf image")
+            # Reset timer to allow retry sooner
+            state.elf_last_generation_time = time.time() - state.elf_generation_interval + 5.0
+    except Exception as e:
+        print(f"Elf generation error: {e}")
+        state.elf_last_generation_time = time.time() - state.elf_generation_interval + 5.0
+    finally:
+        _elf_future = None
+        state.elf_generation_pending = False
+
+    return True
+
+
+def _try_elf_generation(
+    app: ImguiApp,
+    frame: np.ndarray,
+    faces: List,
+    frame_h: int,
+    frame_w: int
+) -> bool:
+    """Try to start async elf image generation from a detected face.
+
+    Returns True if generation was started.
+    """
+    global _elf_future
+    state = app.state
+
+    if not state.elf_mode_active:
+        return False
+
+    # Don't start new generation if one is already pending
+    if state.elf_generation_pending:
+        return False
+
+    # Check if enough time has passed since last generation
+    current_time = time.time()
+    time_since_last = current_time - state.elf_last_generation_time
+    if time_since_last < state.elf_generation_interval:
+        return False
+
+    # Find a face with area >= min_face_pixels
+    best_face = None
+    best_area = 0
+
+    for face in faces:
+        x1, y1, x2, y2 = face.bbox
+        area = (x2 - x1) * (y2 - y1)
+        if area >= state.elf_min_face_pixels and area > best_area:
+            best_face = face
+            best_area = area
+
+    if best_face is None:
+        return False
+
+    # Get the original bounding box
+    x1, y1, x2, y2 = best_face.bbox
+    box_w = x2 - x1
+    box_h = y2 - y1
+
+    # Extend the bounding box:
+    # - 25% wider on each side (total 1.5x width)
+    # - 100% taller downward (total 2x height)
+    extend_x = int(box_w * 0.25)
+    extend_y_down = box_h  # 100% more down
+
+    # Calculate new bounds with extensions
+    new_x1 = max(0, x1 - extend_x)
+    new_y1 = y1  # Keep top the same
+    new_x2 = min(frame_w, x2 + extend_x)
+    new_y2 = min(frame_h, y2 + extend_y_down)
+
+    # Crop the extended area from the frame
+    cropped = frame[new_y1:new_y2, new_x1:new_x2].copy()
+
+    if cropped.size == 0:
+        print("Warning: Empty crop area for elf generation")
+        return False
+
+    print(f"Generating elf from face area {best_area} pixels "
+          f"(extended box: {new_x2-new_x1}x{new_y2-new_y1})")
+
+    # Update the last generation time before starting async task
+    state.elf_last_generation_time = current_time
+    state.elf_generation_pending = True
+
+    # Submit async elf generation
+    _elf_future = generate_elf_async(cropped)
+    return True
 
 
 if __name__ == "__main__":
