@@ -10,6 +10,8 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Optional, Callable
 
+ELF_PROMPT = """The person from <img>0</img> is an elf at a very glamorous Christmas party.
+There are festive decorations, lights, and people in the background."""
 
 def _load_api_key() -> str:
     """Load REVE API key from environment variable or config file.
@@ -83,7 +85,7 @@ def generate_elf(image: np.ndarray) -> np.ndarray | None:
     image_base64 = base64_encode_image(image)
     # Set up request payload
     payload = {
-        "edit_instruction": "Make this person into a Christmas elf at a party",
+        "edit_instruction": ELF_PROMPT,
         "reference_image": image_base64,
         "aspect_ratio": "16:9",
         "version": "latest-fast",
